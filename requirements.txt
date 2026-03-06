@@ -1,0 +1,8 @@
+biopython>=1.81
+numpy>=1.24.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+seaborn>=0.12.0
+scipy>=1.10.0
+ipywidgets>=8.0.0
+notebook>=7.0.0
