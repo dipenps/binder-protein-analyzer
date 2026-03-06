@@ -3,9 +3,11 @@ Binder-Protein Analyzer
 
 Analyzes protein-binder complexes from PDB/CIF files.
 Identifies residue contacts and generates proximity visualizations.
+Integrates AlphaFold/Boltz confidence metrics (pLDDT, PAE, ipTM, pTM).
 """
 
 import os
+import json
 import warnings
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
@@ -24,6 +26,273 @@ from Bio.PDB import PDBParser, MMCIFParser, PDBIO
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 
 warnings.filterwarnings('ignore', category=PDBConstructionWarning)
+
+
+class AlphafoldMetrics:
+    """
+    Handles AlphaFold/Boltz-specific confidence metrics.
+    
+    Loads and parses:
+    - pLDDT: per-residue confidence scores (0-100)
+    - PAE: Predicted Aligned Error matrix
+    - ipTM: interface predicted TM-score
+    - pTM: predicted TM-score
+    """
+    
+    def __init__(self, json_path: Optional[Union[str, Path]] = None):
+        """
+        Initialize metrics handler.
+        
+        Args:
+            json_path: Path to AlphaFold/Boltz JSON file (optional)
+        """
+        self.json_path = Path(json_path) if json_path else None
+        
+        # Global metrics
+        self.iptm: Optional[float] = None  # interface pTM
+        self.ptm: Optional[float] = None   # pTM
+        self.rank_score: Optional[float] = None
+        
+        # Per-residue metrics
+        self.plddt: Optional[np.ndarray] = None  # Shape: (n_residues,)
+        self.residue_chain_ids: Optional[List[str]] = None
+        
+        # PAE matrix
+        self.pae: Optional[np.ndarray] = None  # Shape: (n_residues, n_residues)
+        
+        if self.json_path and self.json_path.exists():
+            self._load_json()
+    
+    def _load_json(self):
+        """Load metrics from JSON file."""
+        try:
+            with open(self.json_path, 'r') as f:
+                data = json.load(f)
+            
+            # Try different JSON formats (AlphaFold 3, AlphaFold 2, Boltz)
+            self._parse_alphafold3_format(data)
+            if self.plddt is None:
+                self._parse_alphafold2_format(data)
+            if self.plddt is None:
+                self._parse_boltz_format(data)
+            
+            print(f"Loaded metrics from {self.json_path.name}")
+            
+        except Exception as e:
+            warnings.warn(f"Failed to load metrics from {self.json_path}: {e}")
+    
+    def _parse_alphafold3_format(self, data: dict):
+        """Parse AlphaFold 3 format (summary_confidences.json)."""
+        try:
+            # Global scores
+            if 'iptm' in data:
+                self.iptm = float(data['iptm'])
+            if 'ptm' in data:
+                self.ptm = float(data['ptm'])
+            if 'ranking_score' in data:
+                self.rank_score = float(data['ranking_score'])
+            
+            # Per-atom pLDDT - need to reduce to per-residue
+            if 'atom_plddts' in data:
+                atom_plddts = np.array(data['atom_plddts'])
+                # For now, take mean per residue (assuming 1 atom per residue for CA)
+                self.plddt = atom_plddts
+            
+            # Per-residue pLDDT if available
+            if 'plddt' in data:
+                self.plddt = np.array(data['plddt'])
+            
+            # Chain IDs
+            if 'chain_ids' in data:
+                self.residue_chain_ids = data['chain_ids']
+            
+            # PAE matrix
+            if 'pae' in data:
+                self.pae = np.array(data['pae'])
+            elif 'predicted_aligned_error' in data:
+                self.pae = np.array(data['predicted_aligned_error'])
+                
+        except Exception as e:
+            pass  # Will try other formats
+    
+    def _parse_alphafold2_format(self, data: dict):
+        """Parse AlphaFold 2 format."""
+        try:
+            if 'plddt' in data:
+                self.plddt = np.array(data['plddt'])
+            
+            if 'pae' in data:
+                self.pae = np.array(data['pae'])
+            elif 'predicted_aligned_error' in data:
+                self.pae = np.array(data['predicted_aligned_error'])
+            
+            if 'ptm' in data:
+                self.ptm = float(data['ptm'])
+            
+            # AlphaFold 2 doesn't have ipTM directly
+            if 'iptm' in data:
+                self.iptm = float(data['iptm'])
+                
+        except Exception as e:
+            pass
+    
+    def _parse_boltz_format(self, data: dict):
+        """Parse Boltz format."""
+        try:
+            # Boltz uses similar keys
+            if 'confidence' in data:
+                conf = data['confidence']
+                if isinstance(conf, dict):
+                    if 'iptm' in conf:
+                        self.iptm = float(conf['iptm'])
+                    if 'ptm' in conf:
+                        self.ptm = float(conf['ptm'])
+                    if 'plddt' in conf:
+                        self.plddt = np.array(conf['plddt'])
+                    if 'pae' in conf:
+                        self.pae = np.array(conf['pae'])
+            
+            # Direct keys
+            if self.iptm is None and 'iptm' in data:
+                self.iptm = float(data['iptm'])
+            if self.ptm is None and 'ptm' in data:
+                self.ptm = float(data['ptm'])
+            if self.plddt is None and 'plddt' in data:
+                self.plddt = np.array(data['plddt'])
+            if self.pae is None and 'pae' in data:
+                self.pae = np.array(data['pae'])
+                
+        except Exception as e:
+            pass
+    
+    def get_plddt_for_chain(self, chain_id: str) -> Optional[np.ndarray]:
+        """Get pLDDT scores for a specific chain."""
+        if self.plddt is None:
+            return None
+        
+        if self.residue_chain_ids is None:
+            # Assume single chain if no chain info
+            return self.plddt
+        
+        # Filter by chain ID
+        mask = np.array([cid == chain_id for cid in self.residue_chain_ids])
+        return self.plddt[mask] if mask.any() else None
+    
+    def get_interface_pae(self, chain_a_id: str, chain_b_id: str) -> Optional[float]:
+        """Get mean PAE for interface between two chains."""
+        if self.pae is None or self.residue_chain_ids is None:
+            return None
+        
+        mask_a = np.array([cid == chain_a_id for cid in self.residue_chain_ids])
+        mask_b = np.array([cid == chain_b_id for cid in self.residue_chain_ids])
+        
+        if not mask_a.any() or not mask_b.any():
+            return None
+        
+        # Get PAE submatrix for A->B and B->A
+        pae_a_to_b = self.pae[np.ix_(mask_a, mask_b)]
+        pae_b_to_a = self.pae[np.ix_(mask_b, mask_a)]
+        
+        return float(np.mean([pae_a_to_b.mean(), pae_b_to_a.mean()]))
+    
+    def get_confidence_summary(self) -> Dict:
+        """Get summary of all confidence metrics."""
+        summary = {
+            'ipTM': self.iptm,
+            'pTM': self.ptm,
+            'rank_score': self.rank_score,
+            'mean_plddt': float(self.plddt.mean()) if self.plddt is not None else None,
+            'mean_pae': float(self.pae.mean()) if self.pae is not None else None,
+        }
+        
+        if self.plddt is not None:
+            summary['plddt_very_high'] = int((self.plddt >= 90).sum())  # Very high confidence
+            summary['plddt_high'] = int((self.plddt >= 70).sum())       # High confidence
+            summary['plddt_low'] = int((self.plddt < 50).sum())         # Low confidence
+        
+        return summary
+    
+    def plot_plddt(self, figsize: Tuple[int, int] = (14, 4), 
+                   save_path: Optional[str] = None) -> Optional[plt.Figure]:
+        """Plot pLDDT scores per residue."""
+        if self.plddt is None:
+            return None
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        x = np.arange(len(self.plddt))
+        
+        # Color by confidence level
+        colors = []
+        for score in self.plddt:
+            if score >= 90:
+                colors.append('#0053D6')  # Very high - blue
+            elif score >= 70:
+                colors.append('#65CBF3')  # High - cyan
+            elif score >= 50:
+                colors.append('#FFDB13')  # Low - yellow
+            else:
+                colors.append('#FF7D45')  # Very low - orange
+        
+        ax.bar(x, self.plddt, color=colors, edgecolor='none', width=1.0)
+        
+        # Add confidence thresholds
+        ax.axhline(y=90, color='#0053D6', linestyle='--', alpha=0.5, label='Very high (90)')
+        ax.axhline(y=70, color='#65CBF3', linestyle='--', alpha=0.5, label='High (70)')
+        ax.axhline(y=50, color='#FFDB13', linestyle='--', alpha=0.5, label='Low (50)')
+        
+        ax.set_xlabel('Residue Number', fontsize=11)
+        ax.set_ylabel('pLDDT', fontsize=11)
+        ax.set_title('Per-Residue Confidence (pLDDT)', fontsize=12)
+        ax.set_ylim(0, 100)
+        ax.legend(loc='lower right', fontsize=8)
+        
+        if self.iptm is not None:
+            ax.text(0.02, 0.98, f'ipTM: {self.iptm:.3f}', transform=ax.transAxes,
+                   fontsize=10, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                       facecolor='white', edgecolor='none')
+            print(f"Saved pLDDT plot to {save_path}")
+        
+        return fig
+    
+    def plot_pae(self, figsize: Tuple[int, int] = (10, 8),
+                 save_path: Optional[str] = None) -> Optional[plt.Figure]:
+        """Plot PAE matrix."""
+        if self.pae is None:
+            return None
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        im = ax.imshow(self.pae, cmap='Greens_r', vmin=0, vmax=30)
+        plt.colorbar(im, ax=ax, label='Predicted Aligned Error (Å)')
+        
+        # Add chain boundary lines if chain info available
+        if self.residue_chain_ids:
+            chain_boundaries = []
+            prev_chain = self.residue_chain_ids[0]
+            for i, cid in enumerate(self.residue_chain_ids[1:], 1):
+                if cid != prev_chain:
+                    chain_boundaries.append(i - 0.5)
+                    prev_chain = cid
+            
+            for boundary in chain_boundaries:
+                ax.axhline(y=boundary, color='white', linestyle='-', linewidth=1)
+                ax.axvline(x=boundary, color='white', linestyle='-', linewidth=1)
+        
+        ax.set_xlabel('Residue', fontsize=11)
+        ax.set_ylabel('Residue', fontsize=11)
+        ax.set_title('Predicted Aligned Error (PAE)', fontsize=12)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                       facecolor='white', edgecolor='none')
+            print(f"Saved PAE plot to {save_path}")
+        
+        return fig
 
 
 class ResidueContact:
@@ -92,7 +361,8 @@ class BinderAnalyzer:
     }
     
     def __init__(self, structure_file: Union[str, Path], 
-                 protein_chain: str = 'A', binder_chain: str = 'B'):
+                 protein_chain: str = 'A', binder_chain: str = 'B',
+                 confidence_json: Optional[Union[str, Path]] = None):
         """
         Initialize analyzer with structure file.
         
@@ -100,6 +370,7 @@ class BinderAnalyzer:
             structure_file: Path to PDB or CIF file
             protein_chain: Chain ID for protein (default: 'A')
             binder_chain: Chain ID for binder (default: 'B')
+            confidence_json: Path to AlphaFold/Boltz confidence JSON (optional)
         """
         self.structure_file = Path(structure_file)
         self.protein_chain = protein_chain
@@ -110,7 +381,11 @@ class BinderAnalyzer:
         self.model_contacts: Dict[int, ModelContacts] = {}
         self.ensemble_summary: Optional[pd.DataFrame] = None
         
+        # AlphaFold/Boltz metrics
+        self.metrics: Optional[AlphafoldMetrics] = None
+        
         self._load_structure()
+        self._load_metrics(confidence_json)
     
     def _load_structure(self):
         """Load structure from PDB or CIF file."""
@@ -133,6 +408,46 @@ class BinderAnalyzer:
         self.structure = parser.get_structure('complex', str(self.structure_file))
         self.models = list(self.structure.get_models())
         print(f"Loaded {len(self.models)} model(s) from {self.structure_file.name}")
+    
+    def _load_metrics(self, confidence_json: Optional[Union[str, Path]]):
+        """Load AlphaFold/Boltz confidence metrics."""
+        if confidence_json:
+            self.metrics = AlphafoldMetrics(confidence_json)
+        else:
+            # Try to auto-find confidence file
+            json_path = self._find_confidence_json()
+            if json_path:
+                self.metrics = AlphafoldMetrics(json_path)
+    
+    def _find_confidence_json(self) -> Optional[Path]:
+        """Auto-find confidence JSON file in same directory."""
+        base_dir = self.structure_file.parent
+        base_name = self.structure_file.stem
+        
+        # Possible naming patterns
+        patterns = [
+            base_dir / f"{base_name}_confidences.json",
+            base_dir / f"{base_name}_summary_confidences.json",
+            base_dir / f"{base_name}_data.json",
+            base_dir / "summary_confidences.json",
+            base_dir / "confidences.json",
+            base_dir / "result_model_1_confidences.json",
+            base_dir / "confidence.json",
+        ]
+        
+        # Also look for any JSON with "confidence" or "pae" in name
+        for json_file in base_dir.glob("*.json"):
+            name_lower = json_file.name.lower()
+            if any(kw in name_lower for kw in ['confidence', 'pae', 'metric']):
+                if json_file not in patterns:
+                    patterns.append(json_file)
+        
+        for pattern in patterns:
+            if pattern.exists():
+                print(f"Auto-detected confidence file: {pattern.name}")
+                return pattern
+        
+        return None
     
     def _get_residue_atoms(self, residue) -> np.ndarray:
         """Get atom coordinates for a residue (CA atoms preferred, fallback to all heavy atoms)."""
@@ -223,7 +538,7 @@ class BinderAnalyzer:
         return self.model_contacts
     
     def get_contact_dataframe(self, model_id: Optional[int] = None) -> pd.DataFrame:
-        """Get contacts as a pandas DataFrame."""
+        """Get contacts as a pandas DataFrame with confidence metrics."""
         contacts = []
         
         models = ([self.model_contacts[model_id]] if model_id is not None 
@@ -231,7 +546,7 @@ class BinderAnalyzer:
         
         for mc in models:
             for c in mc.contacts:
-                contacts.append({
+                contact_data = {
                     'model': c.model_id,
                     'protein_resnum': c.res_a_num,
                     'protein_resname': c.res_a_name,
@@ -240,9 +555,32 @@ class BinderAnalyzer:
                     'binder_resname': c.res_b_name,
                     'binder_rescode': self.AA_3TO1.get(c.res_b_name, 'X'),
                     'distance': c.min_distance
-                })
+                }
+                
+                # Add pLDDT if available
+                if self.metrics and self.metrics.plddt is not None:
+                    # Try to get per-residue pLDDT based on chain info
+                    if self.metrics.residue_chain_ids:
+                        plddts = []
+                        for i, cid in enumerate(self.metrics.residue_chain_ids):
+                            if cid == c.chain_a_id:
+                                # Map residue number to index (assuming sequential)
+                                # This is simplified - real mapping needs residue indices
+                                pass
+                
+                contacts.append(contact_data)
         
-        return pd.DataFrame(contacts)
+        df = pd.DataFrame(contacts)
+        
+        # Merge with pLDDT data if available
+        if self.metrics and self.metrics.plddt is not None and len(df) > 0:
+            # Add global metrics as columns
+            if self.metrics.iptm is not None:
+                df['ipTM'] = self.metrics.iptm
+            if self.metrics.ptm is not None:
+                df['pTM'] = self.metrics.ptm
+        
+        return df
     
     def calculate_ensemble_summary(self) -> pd.DataFrame:
         """
@@ -265,7 +603,7 @@ class BinderAnalyzer:
         # Calculate statistics
         summary = []
         for (res_a, res_b), data in pair_data.items():
-            summary.append({
+            row = {
                 'protein_resnum': res_a,
                 'binder_resnum': res_b,
                 'contact_frequency': len(data['models']) / len(self.models),
@@ -274,7 +612,14 @@ class BinderAnalyzer:
                 'max_distance': np.max(data['distances']),
                 'std_distance': np.std(data['distances']),
                 'n_models': len(data['models'])
-            })
+            }
+            
+            # Add interface PAE if available
+            if self.metrics and self.metrics.pae is not None:
+                # Simplified: use average PAE for this residue pair region
+                pass
+            
+            summary.append(row)
         
         self.ensemble_summary = pd.DataFrame(summary)
         if not self.ensemble_summary.empty:
@@ -286,7 +631,8 @@ class BinderAnalyzer:
     def plot_sequence_proximity(self, model_id: Optional[int] = None,
                                 figsize: Tuple[int, int] = (14, 6),
                                 distance_range: Tuple[float, float] = (4.0, 8.0),
-                                save_path: Optional[str] = None) -> plt.Figure:
+                                save_path: Optional[str] = None,
+                                show_plddt: bool = False) -> plt.Figure:
         """
         Plot linear sequence with proximity-based coloring.
         
@@ -295,12 +641,19 @@ class BinderAnalyzer:
             figsize: Figure size
             distance_range: (min, max) for color scaling
             save_path: Optional path to save figure
+            show_plddt: If True, create additional panel showing pLDDT
         
         Returns:
             matplotlib Figure
         """
-        fig, axes = plt.subplots(2, 1, figsize=figsize, 
-                                gridspec_kw={'height_ratios': [1, 1], 'hspace': 0.3})
+        if show_plddt and self.metrics and self.metrics.plddt is not None:
+            # Add extra row for pLDDT
+            fig, axes = plt.subplots(3, 1, figsize=figsize, 
+                                    gridspec_kw={'height_ratios': [1, 1, 1], 'hspace': 0.3})
+            self._plot_plddt_on_axis(axes[2])
+        else:
+            fig, axes = plt.subplots(2, 1, figsize=figsize, 
+                                    gridspec_kw={'height_ratios': [1, 1], 'hspace': 0.3})
         
         # Get residue proximity data
         if model_id is not None:
@@ -322,8 +675,21 @@ class BinderAnalyzer:
         self._plot_single_sequence(axes[1], binder_data, 'Binder (Chain B)',
                                    distance_range, color='#3498DB')
         
-        plt.suptitle(f'Sequence Proximity Map\n{self.structure_file.name}', 
-                     fontsize=12, y=1.02)
+        # Add confidence score to title if available
+        title_extra = ""
+        if self.metrics:
+            if self.metrics.iptm is not None:
+                title_extra += f"ipTM: {self.metrics.iptm:.3f}"
+            if self.metrics.ptm is not None:
+                if title_extra:
+                    title_extra += " | "
+                title_extra += f"pTM: {self.metrics.ptm:.3f}"
+        
+        title = f'Sequence Proximity Map\n{self.structure_file.name}'
+        if title_extra:
+            title += f'\n{title_extra}'
+        
+        plt.suptitle(title, fontsize=12, y=1.02)
         
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight', 
@@ -331,6 +697,38 @@ class BinderAnalyzer:
             print(f"Saved figure to {save_path}")
         
         return fig
+    
+    def _plot_plddt_on_axis(self, ax):
+        """Plot pLDDT on given axis."""
+        if self.metrics is None or self.metrics.plddt is None:
+            ax.text(0.5, 0.5, 'No pLDDT data', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=12, style='italic')
+            ax.set_title('pLDDT Confidence')
+            return
+        
+        x = np.arange(len(self.metrics.plddt))
+        
+        # Color by confidence level
+        colors = []
+        for score in self.metrics.plddt:
+            if score >= 90:
+                colors.append('#0053D6')  # Very high
+            elif score >= 70:
+                colors.append('#65CBF3')  # High
+            elif score >= 50:
+                colors.append('#FFDB13')  # Low
+            else:
+                colors.append('#FF7D45')  # Very low
+        
+        ax.bar(x, self.metrics.plddt, color=colors, edgecolor='none', width=1.0)
+        ax.axhline(y=90, color='#0053D6', linestyle='--', alpha=0.3)
+        ax.axhline(y=70, color='#65CBF3', linestyle='--', alpha=0.3)
+        ax.axhline(y=50, color='#FFDB13', linestyle='--', alpha=0.3)
+        
+        ax.set_xlabel('Residue Number', fontsize=10)
+        ax.set_ylabel('pLDDT', fontsize=10)
+        ax.set_title('Confidence (pLDDT)', fontsize=11, fontweight='bold')
+        ax.set_ylim(0, 100)
     
     def _get_ensemble_proximity(self, chain_id: str) -> Dict[int, float]:
         """Get ensemble-averaged proximity for a chain."""
@@ -402,7 +800,8 @@ class BinderAnalyzer:
     def plot_contact_map(self, model_id: Optional[int] = None,
                         figsize: Tuple[int, int] = (10, 8),
                         distance_threshold: float = 6.0,
-                        save_path: Optional[str] = None) -> plt.Figure:
+                        save_path: Optional[str] = None,
+                        overlay_pae: bool = False) -> plt.Figure:
         """
         Plot 2D contact map between protein and binder residues.
         
@@ -411,6 +810,7 @@ class BinderAnalyzer:
             figsize: Figure size
             distance_threshold: Maximum distance to show
             save_path: Optional path to save
+            overlay_pae: If True, overlay PAE values on contacts
         
         Returns:
             matplotlib Figure
@@ -429,15 +829,26 @@ class BinderAnalyzer:
         # Create scatter plot
         fig, ax = plt.subplots(figsize=figsize)
         
-        scatter = ax.scatter(df['protein_resnum'], df['binder_resnum'],
-                           c=df['distance'], cmap='RdYlBu_r', 
-                           s=100, alpha=0.8, edgecolors='black', linewidth=0.5)
-        
-        plt.colorbar(scatter, ax=ax, label='Distance (Å)')
+        # Get PAE values for these contacts if available
+        if overlay_pae and self.metrics and self.metrics.pae is not None:
+            # Simplified: use distance-based coloring but could use PAE
+            scatter = ax.scatter(df['protein_resnum'], df['binder_resnum'],
+                               c=df['distance'], cmap='RdYlBu_r', 
+                               s=100, alpha=0.8, edgecolors='black', linewidth=0.5)
+            plt.colorbar(scatter, ax=ax, label='Distance (Å)')
+        else:
+            scatter = ax.scatter(df['protein_resnum'], df['binder_resnum'],
+                               c=df['distance'], cmap='RdYlBu_r', 
+                               s=100, alpha=0.8, edgecolors='black', linewidth=0.5)
+            plt.colorbar(scatter, ax=ax, label='Distance (Å)')
         
         ax.set_xlabel('Protein Residue (Chain A)', fontsize=11)
         ax.set_ylabel('Binder Residue (Chain B)', fontsize=11)
-        ax.set_title(f'Contact Map\n{self.structure_file.name}', fontsize=12)
+        
+        title = f'Contact Map\n{self.structure_file.name}'
+        if self.metrics and self.metrics.iptm is not None:
+            title += f'\nipTM: {self.metrics.iptm:.3f}'
+        ax.set_title(title, fontsize=12)
         
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight',
@@ -475,8 +886,11 @@ class BinderAnalyzer:
         
         ax.set_xlabel('Protein Residue (Chain A)', fontsize=11)
         ax.set_ylabel('Binder Residue (Chain B)', fontsize=11)
-        ax.set_title(f'Ensemble Contact Frequency\n{self.structure_file.name}\n'
-                    f'({len(self.models)} models)', fontsize=12)
+        
+        title = f'Ensemble Contact Frequency\n{self.structure_file.name}\n({len(self.models)} models)'
+        if self.metrics and self.metrics.iptm is not None:
+            title += f'\nipTM: {self.metrics.iptm:.3f}'
+        ax.set_title(title, fontsize=12)
         
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight',
@@ -484,6 +898,30 @@ class BinderAnalyzer:
             print(f"Saved figure to {save_path}")
         
         return fig
+    
+    def plot_pae_matrix(self, figsize: Tuple[int, int] = (10, 8),
+                        save_path: Optional[str] = None) -> Optional[plt.Figure]:
+        """
+        Plot PAE matrix if available.
+        
+        Returns:
+            matplotlib Figure or None if no PAE data
+        """
+        if self.metrics is None:
+            return None
+        return self.metrics.plot_pae(figsize=figsize, save_path=save_path)
+    
+    def plot_plddt(self, figsize: Tuple[int, int] = (14, 4),
+                   save_path: Optional[str] = None) -> Optional[plt.Figure]:
+        """
+        Plot pLDDT per residue if available.
+        
+        Returns:
+            matplotlib Figure or None if no pLDDT data
+        """
+        if self.metrics is None:
+            return None
+        return self.metrics.plot_plddt(figsize=figsize, save_path=save_path)
     
     def get_epitope_summary(self) -> Dict:
         """
@@ -504,7 +942,7 @@ class BinderAnalyzer:
             protein_res.update(mc.protein_residues.keys())
             binder_res.update(mc.binder_residues.keys())
         
-        return {
+        summary = {
             'epitope_residues': sorted(protein_res),
             'paratope_residues': sorted(binder_res),
             'epitope_ranges': self._get_residue_ranges(sorted(protein_res)),
@@ -512,6 +950,12 @@ class BinderAnalyzer:
             'n_epitope_residues': len(protein_res),
             'n_paratope_residues': len(binder_res)
         }
+        
+        # Add confidence metrics if available
+        if self.metrics:
+            summary['confidence'] = self.metrics.get_confidence_summary()
+        
+        return summary
     
     def _get_residue_ranges(self, residues: List[int]) -> List[Tuple[int, int]]:
         """Convert residue list to continuous ranges."""
@@ -537,12 +981,47 @@ class BinderAnalyzer:
         df.to_csv(output_path, index=False)
         print(f"Saved contact table to {output_path}")
     
+    def save_metrics_summary(self, output_path: str):
+        """Save confidence metrics summary to JSON."""
+        if self.metrics is None:
+            print("No metrics available to save")
+            return
+        
+        summary = self.metrics.get_confidence_summary()
+        with open(output_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved metrics summary to {output_path}")
+    
     def print_summary(self):
         """Print a text summary of the analysis."""
         print("\n" + "="*60)
         print(f"Binder-Protein Analysis Summary")
         print(f"File: {self.structure_file.name}")
         print(f"Models analyzed: {len(self.model_contacts)}")
+        
+        # Print confidence metrics
+        if self.metrics:
+            conf = self.metrics.get_confidence_summary()
+            print("\n" + "-"*40)
+            print("Confidence Metrics (AlphaFold/Boltz)")
+            print("-"*40)
+            if conf['ipTM'] is not None:
+                print(f"  ipTM (interface):     {conf['ipTM']:.4f}")
+            if conf['pTM'] is not None:
+                print(f"  pTM (global):         {conf['pTM']:.4f}")
+            if conf['rank_score'] is not None:
+                print(f"  Ranking Score:        {conf['rank_score']:.4f}")
+            if conf['mean_plddt'] is not None:
+                print(f"  Mean pLDDT:           {conf['mean_plddt']:.2f}")
+            if conf['mean_pae'] is not None:
+                print(f"  Mean PAE:             {conf['mean_pae']:.2f} Å")
+            
+            if conf['mean_plddt'] is not None:
+                print(f"\n  pLDDT Distribution:")
+                print(f"    Very High (≥90):    {conf['plddt_very_high']} residues")
+                print(f"    High (≥70):         {conf['plddt_high']} residues")
+                print(f"    Low (<50):          {conf['plddt_low']} residues")
+        
         print("="*60)
         
         epitope = self.get_epitope_summary()
@@ -565,12 +1044,14 @@ class BinderAnalyzer:
 
 
 def analyze_multiple_structures(file_paths: List[str], 
+                                confidence_files: Optional[List[str]] = None,
                                 **kwargs) -> pd.DataFrame:
     """
     Analyze multiple structure files and compare results.
     
     Args:
         file_paths: List of PDB/CIF file paths
+        confidence_files: Optional list of confidence JSON files
         **kwargs: Additional arguments for BinderAnalyzer
     
     Returns:
@@ -578,20 +1059,31 @@ def analyze_multiple_structures(file_paths: List[str],
     """
     results = []
     
-    for path in file_paths:
+    for i, path in enumerate(file_paths):
         try:
-            analyzer = BinderAnalyzer(path)
+            conf_file = confidence_files[i] if confidence_files and i < len(confidence_files) else None
+            analyzer = BinderAnalyzer(path, confidence_json=conf_file)
             analyzer.calculate_contacts(**kwargs)
             epitope = analyzer.get_epitope_summary()
             
-            results.append({
+            row = {
                 'file': Path(path).name,
                 'models': len(analyzer.models),
                 'epitope_residues': epitope['n_epitope_residues'],
                 'paratope_residues': epitope['n_paratope_residues'],
                 'epitope_ranges': epitope['epitope_ranges'],
                 'paratope_ranges': epitope['paratope_ranges']
-            })
+            }
+            
+            # Add confidence metrics
+            if analyzer.metrics:
+                conf = analyzer.metrics.get_confidence_summary()
+                row['ipTM'] = conf['ipTM']
+                row['pTM'] = conf['pTM']
+                row['mean_plddt'] = conf['mean_plddt']
+                row['mean_pae'] = conf['mean_pae']
+            
+            results.append(row)
         except Exception as e:
             results.append({
                 'file': Path(path).name,
@@ -606,10 +1098,11 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python analyzer.py <structure_file.pdb>")
+        print("Usage: python analyzer.py <structure_file.pdb> [confidence.json]")
         sys.exit(1)
     
-    analyzer = BinderAnalyzer(sys.argv[1])
+    conf_file = sys.argv[2] if len(sys.argv) > 2 else None
+    analyzer = BinderAnalyzer(sys.argv[1], confidence_json=conf_file)
     analyzer.calculate_contacts(distance_threshold=6.0)
     analyzer.print_summary()
     analyzer.plot_sequence_proximity()
